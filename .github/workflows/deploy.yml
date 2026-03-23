@@ -11,10 +11,10 @@ jobs:
     steps:
       - name: Pull and deploy
         run: |
-          cd /home/ubuntu/Finovo_backend
+          cd /var/snap/amazon-ssm-agent/12322/Finovo_backend
           git pull origin main
           docker stop finovo-backend || true
           docker rm finovo-backend || true
           docker rmi finovo-backend || true
           docker build -t finovo-backend .
-          docker run -d --name finovo-backend --restart=always --env-file /home/ubuntu/.env -p 8000:8000 finovo-backend
+          docker run -d --name finovo-backend --restart=always --env-file /var/snap/amazon-ssm-agent/12322/Finovo_backend/.env -p 8000:8000 finovo-backend

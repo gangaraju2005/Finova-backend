@@ -128,11 +128,13 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # CORS — configurable per environment
 # ---------------------------------------------------------------------------
 _cors_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "")
-if DEBUG:
-    CORS_ALLOW_ALL_ORIGINS = True
-else:
+if _cors_origins:
+    # If specific origins are set, use them (e.g. for a web frontend)
     CORS_ALLOW_ALL_ORIGINS = False
     CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins.split(",") if o.strip()]
+else:
+    # No origins set — allow all (safe for mobile-only apps like React Native)
+    CORS_ALLOW_ALL_ORIGINS = True
 
 # ---------------------------------------------------------------------------
 # Django REST Framework
