@@ -24,7 +24,10 @@ SECRET_KEY = os.environ.get(
 
 DEBUG = os.environ.get("DEBUG", "True") == "True"
 
-ALLOWED_HOSTS = ["*"]
+# If DEBUG is True, ALLOWED_HOSTS can default to ["*"]
+# In production, specify your domains (e.g., finovo.app, api.finovo.app) in .env
+hosts = os.environ.get("ALLOWED_HOSTS", "*" if DEBUG else "")
+ALLOWED_HOSTS = [h.strip() for h in hosts.split(",")] if hosts else []
 
 # ---------------------------------------------------------------------------
 # Application definition
@@ -157,8 +160,38 @@ SIMPLE_JWT = {
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
 # ---------------------------------------------------------------------------
-# Media files (Profile Photos)
-# Development: Local storage
-# Production (Future): Migrate to AWS S3 or similar by updating DEFAULT_FILE_STORAGE
-MEDIA_URL = "/media/"
-MEDIA_ROOT = BASE_DIR / "profile_photos"
+# Media & Static storage Configuration (Local vs S3)
+# ---------------------------------------------------------------------------
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+AWS_STORAGE_BUCKET_NAME = os.environ.get("AWS_STORAGE_BUCKET_NAME")
+
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_STORAGE_BUCKET_NAME:
+    # Use AWS S3 for media files in production
+    DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
+    AWS_S3_REGION_NAME = os.environ.get("AWS_REGION", "us-east-1")
+    AWS_QUERYSTRING_AUTH = False  # Set to True for expiring URLs
+    MEDIA_URL = f"https://{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com/"
+else:
+    # Development: Local storage
+    MEDIA_URL = "/media/"
+    MEDIA_ROOT = BASE_DIR / "profile_photos"
+
+# Standard Static handling
+STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "static_files"
+
+# ---------------------------------------------------------------------------
+# Email / SMTP Configuration
+# ---------------------------------------------------------------------------
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')  # Set your email adress in .env
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '') # Set your app password in .env
+DEFAULT_FROM_EMAIL = f"Finovo App <{EMAIL_HOST_USER}>"
+
+# Fallback to console backend if credentials are missing
+if not EMAIL_HOST_USER or not EMAIL_HOST_PASSWORD:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'

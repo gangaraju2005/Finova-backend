@@ -8,9 +8,85 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .serializers import LoginSerializer, RegisterSerializer, ProfileSerializer
-from .models import UserProfile
+from .models import UserProfile, OTPVerification
 
 User = get_user_model()
+
+
+class SendOTPView(APIView):
+    """
+    POST /api/users/send-otp/
+    Generates a 6-digit OTP and sends it to the provided email via SMTP.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        if not email:
+            return Response({'error': 'Email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        import random
+        from django.core.mail import send_mail
+        from django.conf import settings
+
+        otp_code = str(random.randint(100000, 999999))
+        
+        # Save or update OTP in DB
+        otp_obj, created = OTPVerification.objects.update_or_create(
+            email=email,
+            defaults={'otp_code': otp_code, 'is_verified': False}
+        )
+        # Note: update_or_create handles the timestamp automatically if using auto_now or manually
+        from django.utils import timezone
+        otp_obj.created_at = timezone.now()
+        otp_obj.save()
+
+        try:
+            send_mail(
+                subject='Finovo Verification Code',
+                message=f'Your verification code for Finovo is: {otp_code}\n\nThis code will expire in 10 minutes.',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=False,
+            )
+            return Response({'message': 'OTP sent successfully.'}, status=status.HTTP_200_OK)
+        except Exception as e:
+            print(f"SMTP Error: {str(e)}")
+            return Response({'error': 'Failed to send email. please try again later.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class VerifyOTPView(APIView):
+    """
+    POST /api/users/verify-otp/
+    Verifies the 6-digit OTP for the given email.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        otp_code = request.data.get('otp', '').strip()
+
+        if not email or not otp_code:
+            return Response({'error': 'Email and OTP are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            otp_obj = OTPVerification.objects.get(email=email, otp_code=otp_code)
+            
+            if otp_obj.is_expired():
+                return Response({'error': 'OTP has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            otp_obj.is_verified = True
+            otp_obj.save()
+            
+            # Step 3: Set is_verified = True for the User
+            user_to_verify = User.objects.filter(email__iexact=email).first()
+            if user_to_verify:
+                user_to_verify.is_verified = True
+                user_to_verify.save()
+            
+            return Response({'message': 'OTP verified successfully.'}, status=status.HTTP_200_OK)
+        except OTPVerification.DoesNotExist:
+            return Response({'error': 'Invalid OTP.'}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class LoginView(APIView):
@@ -54,10 +130,10 @@ class LoginView(APIView):
                 'access':  str(refresh.access_token),
                 'refresh': str(refresh),
                 'user': {
-                    'id':         authenticated_user.id,
-                    'email':      authenticated_user.email,
-                    'first_name': authenticated_user.first_name,
-                    'last_name':  authenticated_user.last_name,
+                    'id':          authenticated_user.id,
+                    'email':       authenticated_user.email,
+                    'username':    authenticated_user.username,
+                    'is_verified': authenticated_user.is_verified,
                 },
             },
             status=status.HTTP_200_OK,
@@ -77,9 +153,11 @@ class RegisterView(APIView):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        full_name = serializer.validated_data['full_name'].strip()
-        email     = serializer.validated_data['email']
-        password  = serializer.validated_data['password']
+        full_name     = serializer.validated_data['full_name'].strip()
+        username      = serializer.validated_data['username']
+        email         = serializer.validated_data['email']
+        mobile_number = serializer.validated_data.get('mobile_number', '')
+        password      = serializer.validated_data['password']
 
         # Split full name into first / last name
         name_parts = full_name.split(' ', 1)
@@ -88,21 +166,25 @@ class RegisterView(APIView):
 
         user = User.objects.create_user(
             email=email,
+            username=username,
             password=password,
             first_name=first_name,
             last_name=last_name,
+            is_verified=False,
         )
 
-        refresh = RefreshToken.for_user(user)
+        # Update profile with mobile number
+        profile = UserProfile.objects.get(user=user)
+        profile.phone_number = mobile_number
+        profile.save()
+
         return Response(
             {
-                'access':  str(refresh.access_token),
-                'refresh': str(refresh),
+                'message': 'Registration successful. Account created.',
                 'user': {
                     'id':         user.id,
                     'email':      user.email,
-                    'first_name': user.first_name,
-                    'last_name':  user.last_name,
+                    'username':   user.username,
                 },
             },
             status=status.HTTP_201_CREATED,
@@ -172,3 +254,85 @@ class ProfileView(APIView):
 
         serializer = ProfileSerializer({'user': user, 'profile': profile})
         return Response(serializer.data)
+
+
+class ForgotPasswordView(APIView):
+    """
+    POST /api/auth/forgot-password/
+    Sends a recovery OTP to the user's email.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        if not email:
+            return Response({'error': 'Email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check if user exists
+        if not User.objects.filter(email__iexact=email).exists():
+            # Return 200 even if user doesn't exist for security or 404
+            # Here let's be more specific for now.
+            return Response({'error': 'No account found with this email.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Generate OTP
+        import random
+        from django.core.mail import send_mail
+        from django.conf import settings
+        from django.utils import timezone
+
+        otp_code = str(random.randint(100000, 999999))
+        OTPVerification.objects.update_or_create(
+            email=email,
+            defaults={'otp_code': otp_code, 'is_verified': False, 'created_at': timezone.now()}
+        )
+
+        try:
+            send_mail(
+                subject='Finovo Password Recovery',
+                message=f'Your recovery code for Finovo is: {otp_code}\n\nThis code will expire in 5 minutes.',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=False,
+            )
+            return Response({'message': 'Recovery code sent to your email.'}, status=status.HTTP_200_OK)
+        except Exception as e:
+            print(f"SMTP Error during recovery: {str(e)}")
+            return Response({'error': 'Failed to send recovery email. Try again later.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ResetPasswordView(APIView):
+    """
+    POST /api/auth/reset-password/
+    Resets password using a valid OTP.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        otp_code = request.data.get('otp', '').strip()
+        new_password = request.data.get('new_password', '').strip()
+
+        if not email or not otp_code or not new_password:
+            return Response({'error': 'Email, OTP, and new password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            otp_obj = OTPVerification.objects.get(email=email, otp_code=otp_code)
+            
+            if otp_obj.is_expired():
+                return Response({'error': 'Recovery code has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Reset user password
+            user = User.objects.get(email__iexact=email)
+            user.set_password(new_password)
+            user.is_verified = True # Optionally mark as verified if they reset password
+            user.save()
+            
+            # Mark OTP as used/verified
+            otp_obj.is_verified = True
+            otp_obj.save()
+            
+            return Response({'message': 'Password reset successful. You can now log in.'}, status=status.HTTP_200_OK)
+        except OTPVerification.DoesNotExist:
+            return Response({'error': 'Invalid recovery code.'}, status=status.HTTP_400_BAD_REQUEST)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
