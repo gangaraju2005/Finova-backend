@@ -179,7 +179,7 @@ else:
     MEDIA_ROOT = BASE_DIR / "profile_photos"
 
 # Standard Static handling
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "static_files"
 
 # ---------------------------------------------------------------------------
