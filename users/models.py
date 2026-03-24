@@ -1,0 +1,109 @@
+from django.contrib.auth.models import AbstractUser, BaseUserManager
+from django.db import models
+from django.utils.translation import gettext_lazy as _
+
+class CustomUserManager(BaseUserManager):
+    """
+    Custom user model manager where email is the unique identifier
+    for authentication instead of usernames.
+    """
+    def create_user(self, email, password=None, **extra_fields):
+        if not email:
+            raise ValueError(_("The Email must be set"))
+        email = self.normalize_email(email)
+        user = self.model(email=email, **extra_fields)
+        user.set_password(password)
+        user.save()
+        return user
+
+    def create_superuser(self, email, password=None, **extra_fields):
+        extra_fields.setdefault("is_staff", True)
+        extra_fields.setdefault("is_superuser", True)
+        extra_fields.setdefault("is_active", True)
+
+        if extra_fields.get("is_staff") is not True:
+            raise ValueError(_("Superuser must have is_staff=True."))
+        if extra_fields.get("is_superuser") is not True:
+            raise ValueError(_("Superuser must have is_superuser=True."))
+        return self.create_user(email, password, **extra_fields)
+
+class CustomUser(AbstractUser):
+    """
+    Custom User model for Finovo.
+    Uses email as the primary unique identifier for authentication
+    and entirely removes the default username field.
+    """
+    username = models.CharField(max_length=150, unique=True, null=True, blank=True)
+    email = models.EmailField(_("email address"), unique=True)
+    is_verified = models.BooleanField(default=False)
+    
+    USERNAME_FIELD = "email"
+    REQUIRED_FIELDS = ['username']
+
+    objects = CustomUserManager()
+
+    def __str__(self):
+        return self.email
+
+
+class UserProfile(models.Model):
+    """
+    One-to-one extension of CustomUser.
+    Stores extra profile data like monthly savings goal.
+    Created automatically on user registration via a Django signal.
+    """
+    user = models.OneToOneField(
+        CustomUser,
+        on_delete=models.CASCADE,
+        related_name='profile',
+    )
+    monthly_savings_goal = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0.00,
+        help_text='Monthly savings target in the user\'s currency.',
+    )
+    avatar = models.FileField(upload_to='avatars/', null=True, blank=True)
+    phone_number = models.CharField(max_length=20, blank=True, default='',
+        help_text='User phone number, e.g. +1 (555) 000-1234')
+    
+    # Notification Settings (Defaults to True)
+    budget_alerts_enabled = models.BooleanField(default=True)
+    weekly_reports_enabled = models.BooleanField(default=True)
+    daily_reminders_enabled = models.BooleanField(default=True)
+    email_updates_enabled = models.BooleanField(default=True)
+    push_notifications_enabled = models.BooleanField(default=True)
+    new_features_enabled = models.BooleanField(default=True)
+
+    @property
+    def avatar_url(self):
+        """Returns the full URL to the avatar either from file or generic default."""
+        if self.avatar:
+            try:
+                return self.avatar.url
+            except ValueError:
+                return ""
+        return ""
+
+    def __str__(self):
+        return f'Profile({self.user.email})'
+
+
+class OTPVerification(models.Model):
+    """
+    Temporary storage for OTP codes sent via email.
+    Codes expire after 10 minutes.
+    """
+    email = models.EmailField()  # Removed unique=True to allow retries/new codes
+    otp_code = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_verified = models.BooleanField(default=False)
+
+    def is_expired(self):
+        from django.utils import timezone
+        from datetime import timedelta
+        # Expiry set to 5 minutes
+        return timezone.now() > self.created_at + timedelta(minutes=5)
+
+    def __str__(self):
+        return f"OTP for {self.email} ({'Verified' if self.is_verified else 'Pending'})"
