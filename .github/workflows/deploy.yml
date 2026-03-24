@@ -1,0 +1,20 @@
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Pull and deploy
+        run: |
+          cd /home/ubuntu/app/Finovo_backend
+          git pull origin main
+          docker stop finovo-backend || true
+          docker rm finovo-backend || true
+          docker rmi finovo-backend || true
+          docker build -t finovo-backend .
+          docker run -d --name finovo-backend --restart=always --env-file /home/ubuntu/app/Finovo_backend/.env -p 8000:8000 finovo-backend
