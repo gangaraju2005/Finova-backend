@@ -16,9 +16,85 @@ import random
 import string
 
 from .serializers import LoginSerializer, RegisterSerializer, ProfileSerializer
-from .models import UserProfile
+from .models import UserProfile, OTPVerification
 
 User = get_user_model()
+
+
+class SendOTPView(APIView):
+    """
+    POST /api/users/send-otp/
+    Generates a 6-digit OTP and sends it to the provided email via SMTP.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        if not email:
+            return Response({'error': 'Email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        import random
+        from django.core.mail import send_mail
+        from django.conf import settings
+
+        otp_code = str(random.randint(100000, 999999))
+        
+        # Save or update OTP in DB
+        otp_obj, created = OTPVerification.objects.update_or_create(
+            email=email,
+            defaults={'otp_code': otp_code, 'is_verified': False}
+        )
+        # Note: update_or_create handles the timestamp automatically if using auto_now or manually
+        from django.utils import timezone
+        otp_obj.created_at = timezone.now()
+        otp_obj.save()
+
+        try:
+            send_mail(
+                subject='Finovo Verification Code',
+                message=f'Your verification code for Finovo is: {otp_code}\n\nThis code will expire in 10 minutes.',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=False,
+            )
+            return Response({'message': 'OTP sent successfully.'}, status=status.HTTP_200_OK)
+        except Exception as e:
+            print(f"SMTP Error: {str(e)}")
+            return Response({'error': 'Failed to send email. please try again later.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class VerifyOTPView(APIView):
+    """
+    POST /api/users/verify-otp/
+    Verifies the 6-digit OTP for the given email.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        otp_code = request.data.get('otp', '').strip()
+
+        if not email or not otp_code:
+            return Response({'error': 'Email and OTP are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            otp_obj = OTPVerification.objects.get(email=email, otp_code=otp_code)
+            
+            if otp_obj.is_expired():
+                return Response({'error': 'OTP has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            otp_obj.is_verified = True
+            otp_obj.save()
+            
+            # Step 3: Set is_verified = True for the User
+            user_to_verify = User.objects.filter(email__iexact=email).first()
+            if user_to_verify:
+                user_to_verify.is_verified = True
+                user_to_verify.save()
+            
+            return Response({'message': 'OTP verified successfully.'}, status=status.HTTP_200_OK)
+        except OTPVerification.DoesNotExist:
+            return Response({'error': 'Invalid OTP.'}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class LoginView(APIView):
@@ -99,9 +175,11 @@ class RegisterView(APIView):
 
         user = User.objects.create_user(
             email=email,
+            username=username,
             password=password,
             first_name=first_name,
             last_name=last_name,
+            is_verified=False,
         )
 
         from .models import UserProfile
@@ -125,8 +203,7 @@ class RegisterView(APIView):
         refresh = RefreshToken.for_user(user)
         return Response(
             {
-                'access':  str(refresh.access_token),
-                'refresh': str(refresh),
+                'message': 'Registration successful. Account created.',
                 'user': {
                     'id':           user.id,
                     'email':        user.email,

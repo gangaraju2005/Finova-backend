@@ -1,7 +1,26 @@
+import re
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 
 User = get_user_model()
+
+
+def validate_password_complexity(value):
+    """
+    Password must have at least 8 characters, one uppercase,
+    one lowercase, one digit, and one special character.
+    """
+    if len(value) < 8:
+        raise serializers.ValidationError("Password must be at least 8 characters long.")
+    if not re.search(r'[A-Z]', value):
+        raise serializers.ValidationError("Password must contain at least one uppercase letter.")
+    if not re.search(r'[a-z]', value):
+        raise serializers.ValidationError("Password must contain at least one lowercase letter.")
+    if not re.search(r'\d', value):
+        raise serializers.ValidationError("Password must contain at least one digit.")
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', value):
+        raise serializers.ValidationError("Password must contain at least one special character (!@#$%^&*...).")
+    return value
 
 
 class LoginSerializer(serializers.Serializer):
@@ -27,10 +46,13 @@ class RegisterSerializer(serializers.Serializer):
         style={'input_type': 'password'},
     )
 
+    def validate_password(self, value):
+        return validate_password_complexity(value)
+
     def validate_email(self, value):
         if User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError(
-                'An account with this email already exists.'
+                'Account with this email already exists.'
             )
         return value.lower()
 
@@ -54,6 +76,7 @@ class ProfileSerializer(serializers.Serializer):
     monthly_savings_goal = serializers.SerializerMethodField()
     avatar_url           = serializers.SerializerMethodField()
     phone_number         = serializers.SerializerMethodField()
+    is_verified          = serializers.SerializerMethodField()
 
     def get_id(self, obj):
         return obj['user'].id
@@ -85,3 +108,6 @@ class ProfileSerializer(serializers.Serializer):
 
     def get_phone_number(self, obj):
         return obj['profile'].phone_number or ''
+
+    def get_is_verified(self, obj):
+        return obj['user'].is_verified

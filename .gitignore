@@ -5,6 +5,7 @@ env/
 
 # Environment variables
 .env
+.env.production
 
 # Python
 __pycache__/
@@ -21,9 +22,14 @@ build/
 local_settings.py
 db.sqlite3
 media/
+static_files/
+profile_photos/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# OS
+.DS_Store

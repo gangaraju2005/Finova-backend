@@ -1,0 +1,101 @@
+# Finovo Database Schema Documentation
+
+This document provides a comprehensive overview of the data storage architecture for the Finovo application. The system uses a hybrid approach: **RDS (PostgreSQL)** for transactional integrity and **DynamoDB** for high-performance analytical projections.
+
+---
+
+## 1. RDS (PostgreSQL) - Relational Storage
+The primary database for user accounts, transactional records, and application settings.
+
+### Table: users_customuser
+*   **Purpose**: core authentication table. Uses email as the primary login identifier.
+*   **Fields**:
+    *   `id`: Primary Key (Auto-increment).
+    *   `email`: Unique email address (Used for login).
+    *   `password`: Hashed password.
+    *   `is_verified`: Boolean flag indicating if the user has verified their email via OTP.
+    *   `is_active` / `is_staff` / `is_superuser`: Standard Django permissions.
+    *   `date_joined`: Timestamp of account creation.
+
+### Table: users_userprofile
+*   **Purpose**: Extends the user model with extra metadata and settings.
+*   **Fields**:
+    *   `user_id`: One-to-One link to CustomUser.
+    *   `monthly_savings_goal`: Decimal value representing the user's monthly target.
+    *   `avatar`: File path to the user's profile picture (stored on S3 in production).
+    *   `phone_number`: Optional contact string.
+    *   **Notification Flags**: `budget_alerts_enabled`, `weekly_reports_enabled`, `daily_reminders_enabled`, etc.
+
+### Table: users_otpverification
+*   **Purpose**: Temporary store for 6-digit OTP codes.
+*   **Fields**:
+    *   `email`: Target email for the code.
+    *   `otp_code`: 6-digit string.
+    *   `created_at`: Time of generation (codes expire in 5 minutes).
+    *   `is_verified`: Becomes true once valid OTP is entered.
+
+### Table: transactions_category
+*   **Purpose**: Lookup table for transaction types (e.g., Food, Salary, Rent).
+*   **Fields**:
+    *   `user_id`: FK to CustomUser. Null if the category is "Global" (default).
+    *   `name`: Category name (e.g., "Shopping").
+    *   `type`: Choice field (INCOME or EXPENSE).
+    *   `icon_name`: MaterialCommunityIcons string (e.g., "cart").
+    *   `color`: Hex code for UI representation.
+
+### Table: transactions_transaction
+*   **Purpose**: The central ledger for all user financial activity.
+*   **Fields**:
+    *   `user_id`: FK to CustomUser.
+    *   `category_id`: FK to Category.
+    *   `amount`: Decimal (total value).
+    *   `description`: User-provided note.
+    *   `payment_method`: Choice (CASH, CARD, UPI, BANK_TRANSFER, etc.).
+    *   `date`: The actual transaction date/time.
+
+### Table: transactions_budget
+*   **Purpose**: Tracks user-defined spending limits per category per month.
+*   **Fields**:
+    *   `user_id`: FK to CustomUser.
+    *   `category_id`: FK to Category.
+    *   `amount`: Monthly limit.
+    *   `month`: Date representing the first day of the budget month.
+*   **Constraint**: Unique combination of (user, category, month).
+
+### Table: transactions_notification
+*   **Purpose**: History of in-app alerts sent to the user.
+*   **Fields**:
+    *   `user_id`: FK to CustomUser.
+    *   `title` / `message`: UI content.
+    *   `is_read` / `is_starred`: Interaction states.
+    *   `notification_type`: e.g., 'BUDGET' alert or 'TRANSACTION' added.
+
+---
+
+## 2. DynamoDB (NoSQL) - Analytical Cache
+Used in production to offload heavy analytical calculations from RDS.
+
+### Table: FinovoProjections (Production Only)
+*   **Purpose**: Stores pre-calculated "Analytical Projections." Instead of calculating complex dashboard data from millions of RDS rows on every app open, the server reads a single flat document from DynamoDB.
+*   **Primary Key (Partition Key)**: `userId` (String)
+*   **Sort Key**: `monthLabel` (String, e.g., "2024-10")
+*   **Attributes**:
+    *   `startDate` / `endDate`: Range of the projection.
+    *   `data`: A deeply nested JSON map containing:
+        *   Total Income/Expense.
+        *   Daily spending trends.
+        *   Category-wise percentage splits.
+        *   Budget progress stats.
+    *   `updatedAt`: Timestamp of the last calculation.
+
+---
+
+## 3. Data Flow Overview
+1.  **Write Path**: When a user adds a transaction, it is written immediately to **RDS**.
+2.  **Calculation Path**: On the next request to `/analytics/`, the system checks **DynamoDB**.
+    *   **Cache Hit**: If a projection exists for that month and is recent, it returns the DynamoDB data (extremely fast).
+    *   **Cache Miss**: The system calculates the data from **RDS**, returns it to the user, and asynchronously pushes the result to **DynamoDB** to serve future requests.
+3.  **Media Path**: Profile photos are uploaded to **AWS S3**, with the URL stored in the `users_userprofile` table.
+
+---
+*Created on: March 23, 2026*
