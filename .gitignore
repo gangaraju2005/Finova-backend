@@ -5,6 +5,7 @@ env/
 
 # Environment variables
 .env
+.env.production
 
 # Python
 __pycache__/
@@ -21,6 +22,8 @@ build/
 local_settings.py
 db.sqlite3
 media/
+static_files/
+profile_photos/
 
 # IDE
 .vscode/
@@ -31,3 +34,6 @@ media/
 .terraform/
 *.tfstate
 *.tfstate.backup.terraform/ 
+
+# OS
+.DS_Store

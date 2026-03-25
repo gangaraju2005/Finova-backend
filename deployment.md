@@ -1,227 +1,280 @@
 # Finovo Deployment Guide
 
-This document provides complete, step-by-step guidance for deploying the Finovo application. It covers both local development setup and a production-grade AWS deployment architecture using EC2, RDS, and Application Load Balancer (ALB).
+Complete guide for deploying Finovo Backend on AWS with Docker, self-hosted GitHub Actions runner, and automated CI/CD.
 
-## 1. Project Overview
+## 1. Architecture
 
-Finovo is a full-stack personal finance application structured with the following architecture:
-- **Frontend**: React Native (Expo) mobile application.
-- **Backend**: Django REST Framework providing the API.
-- **Relational Database**: Amazon RDS (PostgreSQL) for structured data (Users, Transactions, Budgets).
-- **NoSQL Database**: Amazon DynamoDB for potentially scalable, flexible document storage.
-- **Object Storage**: Amazon S3 for storing user avatars and file uploads.
-- **Email Service**: SMTP server integration for sending verification OTPs and reports.
+```
+  GitHub (push to main)
+        │
+        ▼
+  ┌─────────────────────┐
+  │ Self-Hosted Runner   │ ← runs ON the EC2 instance
+  │ git pull → docker    │
+  │ build → swap         │
+  └──────────┬──────────┘
+             │
+    Internet  │
+        │     │
+   ┌────▼────┐│
+   │   ALB   ││  (public subnets, HTTPS via ACM)
+   └────┬────┘│
+        │     │
+  ┌─────▼─────▼────┐
+  │  Target Group   │  health check: GET /api/health/
+  └────────┬────────┘
+           │ Port 8000
+   ┌───────▼───────┐
+   │  EC2 (private  │  Docker + GH Runner
+   │   subnet)      │  Port 8000
+   └──┬──────────┬──┘
+      │          │
+┌─────▼───┐  ┌──▼───────────┐
+│ RDS PG   │  │ DynamoDB     │
+│ (private)│  │ projections  │
+│ 5432     │  └──────────────┘
+└──────────┘
+      │
+┌─────▼─────┐
+│  S3 Bucket │  avatars / media
+└────────────┘
+```
 
 ---
 
 ## 2. Environment Variables
 
-Below is the list of all required environment variables for the application to run successfully. 
+See `.env.production` for a full template. Key variables:
 
 ```env
-# Core Django Config
-SECRET_KEY=__________
-DEBUG=__________
-ALLOWED_HOSTS=__________
-
-# Relational Database (RDS PostgreSQL)
-DB_NAME=__________
-DB_USER=__________
-DB_PASSWORD=__________
-DB_HOST=__________
-DB_PORT=__________
-
-# AWS Configuration (S3 / DynamoDB)
-AWS_ACCESS_KEY_ID=__________
-AWS_SECRET_ACCESS_KEY=__________
-AWS_STORAGE_BUCKET_NAME=__________
-DYNAMO_TABLE_NAME=__________
-AWS_REGION=__________
-
-# SMTP Email Service (OTP verification)
-EMAIL_HOST=__________
-EMAIL_PORT=__________
-EMAIL_HOST_USER=__________
-EMAIL_HOST_PASSWORD=__________
-EMAIL_USE_TLS=__________
+SECRET_KEY, DEBUG=False, ALLOWED_HOSTS, CORS_ALLOWED_ORIGINS
+DB_NAME, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET_NAME, AWS_REGION
+DYNAMO_TABLE_NAME=finovo_projections
+EMAIL_HOST, EMAIL_PORT, EMAIL_HOST_USER, EMAIL_HOST_PASSWORD, EMAIL_USE_TLS
 ```
 
-### Variable Explanations
-- **Core Setup**: `SECRET_KEY` encrypts session data. `DEBUG` should remain `False` in production. `ALLOWED_HOSTS` contains the IP or domain name of your EC2/ALB.
-- **Database**: Credentials pointing to your local database or remote AWS RDS PostgreSQL instance.
-- **AWS Configuration**: IAM credentials and S3 bucket details for storing media attachments.
-- **SMTP Service**: Email credentials required to securely send OTP verification codes to users.
+**Store credentials**: `.env` file on EC2 at `/home/ubuntu/.env` (referenced by Docker `--env-file`).
 
 ---
 
-## 3. Where to Store Credentials
+## 3. AWS Infrastructure Setup
 
-To maintain security, adhere strictly to the following credential management practices:
-- **Local Development**: Keep variables in a `.env` file at the root of your backend project directory.
-- **Production (AWS)**: Inject variables directly into the server environment or utilize **AWS Secrets Manager** / **AWS Systems Manager Parameter Store** to feed variables securely into your instances.
-- **SCM**: **Do NOT commit** your `.env` or secret keys to GitHub. Ensure `.env` is included in your `.gitignore`.
+### Step 1: VPC + Networking
 
----
+1. **Create VPC**: `10.0.0.0/16`
+2. **Subnets** (2 AZs):
 
-## 4. Local Development Setup
+   | Subnet | CIDR | Type | AZ |
+   |--------|------|------|----|
+   | `finovo-public-1` | `10.0.1.0/24` | Public | us-east-1a |
+   | `finovo-public-2` | `10.0.2.0/24` | Public | us-east-1b |
+   | `finovo-private-1` | `10.0.3.0/24` | Private | us-east-1a |
+   | `finovo-private-2` | `10.0.4.0/24` | Private | us-east-1b |
 
-Follow these steps to quickly test the application backend locally:
+3. **Internet Gateway** → attach to VPC
+4. **NAT Gateway** → create in `finovo-public-1` with Elastic IP
+5. **Route Tables**:
+   - Public RT: `0.0.0.0/0 → IGW` → associate with public subnets
+   - Private RT: `0.0.0.0/0 → NAT GW` → associate with private subnets
 
-1. **Create Virtual Environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows use: venv\Scripts\activate
-   ```
-2. **Install Requirements**
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. **Setup `.env` File**
-   Create a `.env` file inside the `backend/` directory using the template shown in Section 2.
-4. **Run Migrations**
-   ```bash
-   python manage.py migrate
-   ```
-5. **Start Django Server**
-   ```bash
-   python manage.py runserver 0.0.0.0:8000
-   ```
+> **Note**: NAT Gateway is critical — EC2 needs outbound internet for: GitHub runner communication, Docker Hub pulls, SMTP email, pip installs.
 
----
+### Step 2: Security Groups
 
-## 5. Production Deployment (EC2)
+| SG Name | Inbound Rules | Purpose |
+|---------|---------------|---------|
+| `finovo-alb-sg` | 80 from `0.0.0.0/0`, 443 from `0.0.0.0/0` | ALB |
+| `finovo-ec2-sg` | 8000 from `finovo-alb-sg` only | EC2 |
+| `finovo-rds-sg` | 5432 from `finovo-ec2-sg` only | RDS |
 
-Follow these steps for a complete production rollout on an AWS EC2 instance:
+### Step 3: RDS PostgreSQL
 
-1. **Launch EC2 Instance**: Provision an Ubuntu Linux instance and connect via SSH.
-2. **Install Dependencies**:
-   ```bash
-   sudo apt update
-   sudo apt install python3-pip python3-venv nginx libpq-dev postgresql-client
-   ```
-3. **Clone Repository**:
-   ```bash
-   git clone <your-repository-url>
-   cd Finovo/backend
-   ```
-4. **Setup Virtual Environment**:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
-5. **Add Environment Variables**:
-   Create the `.env` file or export the required variables securely into the OS environment.
-6. **Run Migrations**:
-   ```bash
-   python manage.py migrate
-   ```
-7. **Collect Static Files**:
-   ```bash
-   python manage.py collectstatic --noinput
-   ```
+1. **RDS → Create Database** → PostgreSQL 16
+2. **Instance**: `db.t3.micro` (Free Tier eligible)
+3. **DB Identifier**: `finovo-prod`
+4. **Master Username**: `finovo_admin`
+5. **VPC**: Your VPC, **Subnet Group**: both private subnets
+6. **Security Group**: `finovo-rds-sg`
+7. **Public Access**: **No**
+8. **Initial DB Name**: `finovo_prod`
 
----
+Copy the **Endpoint** → `DB_HOST` in `.env`.
 
-## 6. Gunicorn Setup
+### Step 4: S3 Bucket
 
-In production, avoid using `runserver`. Instead, use Gunicorn as the WSGI HTTP Server.
-
-1. **Install Gunicorn**:
-   ```bash
-   pip install gunicorn
-   ```
-2. **Test Gunicorn Bind**:
-   ```bash
-   gunicorn core.wsgi:application --bind 0.0.0.0:8000 --workers 3
-   ```
-   *(Note: Adjust `core.wsgi` to match the exact name of your main Django project folder).*
-
-For a permanent setup, configure Gunicorn to run as a `systemd` background service to execute autonomously.
-
----
-
-## 7. NGINX Configuration
-
-NGINX sits in front of Gunicorn, acting as a reverse proxy mapping port 80 traffic to port 8000.
-
-1. Create a configuration file: `/etc/nginx/sites-available/finovo`
-   ```nginx
-   server {
-       listen 80;
-       server_name your_domain_or_IP;
-
-       location = /favicon.ico { access_log off; log_not_found off; }
-       
-       location /static/ {
-           root /home/ubuntu/Finovo/backend;
-       }
-
-       location /media/ {
-           root /home/ubuntu/Finovo/backend;
-       }
-
-       location / {
-           proxy_set_header Host $http_host;
-           proxy_set_header X-Real-IP $remote_addr;
-           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-           proxy_pass http://127.0.0.1:8000;
-       }
+1. **Name**: `finovo-media-prod` (globally unique)
+2. **Region**: `us-east-1`
+3. **Bucket Policy** (public read for avatars):
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Principal": "*",
+       "Action": "s3:GetObject",
+       "Resource": "arn:aws:s3:::finovo-media-prod/*"
+     }]
    }
    ```
-2. **Enable and Restart**:
-   ```bash
-   sudo ln -s /etc/nginx/sites-available/finovo /etc/nginx/sites-enabled
-   sudo systemctl restart nginx
-   ```
+
+### Step 5: DynamoDB Table
+
+1. **Table Name**: `finovo_projections`
+2. **Partition Key**: `userId` (String)
+3. **Sort Key**: `monthLabel` (String)
+4. **Capacity**: On-demand
+
+### Step 6: IAM User for Backend
+
+Create IAM user `finovo-backend-service` with this policy:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::finovo-media-prod", "arn:aws:s3:::finovo-media-prod/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/finovo_projections"
+    }
+  ]
+}
+```
+Create **Access Keys** → `.env` as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+
+### Step 7: EC2 Instance
+
+1. **AMI**: Ubuntu 24.04 LTS
+2. **Instance Type**: `t3.small`
+3. **Subnet**: `finovo-private-1`
+4. **Security Group**: `finovo-ec2-sg`
+5. **IAM Role**: Attach `AmazonSSMManagedInstanceCore` for SSM access
+6. **No public IP**
+
+**Connect via SSM:**
+```bash
+aws ssm start-session --target i-xxxxxxxxxxxx
+```
+
+### Step 8: EC2 Setup — Docker + GitHub Runner
+
+SSH into EC2 via SSM, then run the setup script:
+
+```bash
+# Clone repo (first time only)
+git clone https://github.com/KarthikHT-DEV/Finovo_backend.git
+cd Finovo_backend
+
+# Create .env file
+nano /home/ubuntu/.env
+# (paste values from .env.production, fill in real values)
+
+# Run the runner setup script
+chmod +x scripts/setup-runner.sh
+./scripts/setup-runner.sh
+```
+
+The script will:
+1. Install Docker
+2. Download GitHub Actions runner
+3. Ask you for a runner token (get it from your repo → Settings → Actions → Runners → New)
+4. Register and start the runner as a systemd service
+
+### Step 9: ALB + Target Group
+
+1. **Create Target Group** (`finovo-tg`):
+   - Protocol: HTTP, Port: 8000
+   - Health check: `/api/health/` (interval: 30s, threshold: 2)
+   - Register: your EC2 instance
+
+2. **Create ALB** (`finovo-alb`):
+   - Internet-facing, both public subnets
+   - Security Group: `finovo-alb-sg`
+   - Listener: HTTP:80 → forward to `finovo-tg`
+
+3. **Test**: `curl http://<alb-dns>/api/health/`
+
+### Step 10: HTTPS (Recommended)
+
+1. **ACM → Request Certificate** for `api.yourdomain.com`
+2. Validate via DNS
+3. **ALB → Add HTTPS:443 listener** → forward to `finovo-tg`, select ACM cert
+4. **Edit HTTP:80** → redirect to HTTPS:443
+5. Point domain DNS to ALB
 
 ---
 
-## 8. Database Connection
+## 4. CI/CD Pipeline
 
-To connect Django reliably to **AWS RDS (PostgreSQL)**:
-- Navigate to AWS RDS and assure your PostgreSQL instance is publicly accessible OR correctly peered internally via a VPC.
-- Set the `DB_HOST` in your environment variables to the **Endpoint URL** provided under RDS Connectivity & Security.
-- **Security Groups**: You *must* authorize the RDS Security Group to allow inbound PostgreSQL traffic (port 5432) originating from the Security Group associated with your EC2 instance. 
+The pipeline at `.github/workflows/deploy.yml` runs automatically on push to `main`:
 
----
+```
+Push to main
+  → Self-hosted runner (on EC2) picks up job
+  → git checkout latest code
+  → docker stop old container
+  → docker build new image
+  → docker run new container (--env-file /home/ubuntu/.env)
+  → python manage.py migrate
+  → Health check (curl /api/health/)
+  → Prune old images
+```
 
-## 9. S3 and DynamoDB Configuration
+**No ECR, no SSH, no external access needed.** The runner sits on the EC2 and does everything locally.
 
-AWS Services are used for offloading heavy storage and high-speed read operations.
+### First Manual Deploy
 
-1. **Amazon S3**: Utilized for serving media files (user avatars, generic uploads).
-   - Update Django settings to utilize `boto3` and `django-storages`.
-   - **IAM Permissions**: The IAM User requires `s3:PutObject`, `s3:GetObject`, and `s3:ListBucket`.
-2. **Amazon DynamoDB**: Utilized for serving pre-calculated "Analytics Projections".
-   - The application automatically pushes calculated summaries to DynamoDB when `DYNAMO_TABLE_NAME` is present.
-   - **IAM Permissions**: The IAM User requires `dynamodb:PutItem`, `dynamodb:GetItem`, and `dynamodb:UpdateItem` for the specified table.
-   - **Schema**: Create a table with Partition Key `userId` (String) and Sort Key `monthLabel` (String).
-
----
-
-## 10. SMTP Configuration
-
-The application uses SMTP specifically to shoot OTP verifications upon sign-up alongside systemic reporting emails.
-- If using Gmail: Enter `smtp.gmail.com` under `EMAIL_HOST` and `587` for `EMAIL_PORT`.
-- Generate an "App Password" inside your Google Workspace / Gmail account to use as `EMAIL_HOST_PASSWORD`, keeping your master password safe.
-- Enable `EMAIL_USE_TLS=True` unconditionally in your environment config.
+Before the pipeline takes over, do the first deploy manually:
+```bash
+cd ~/Finovo_backend
+docker build -t finovo-backend:latest .
+docker run -d --name finovo-backend --restart=always --env-file /home/ubuntu/.env -p 8000:8000 finovo-backend:latest
+docker exec finovo-backend python manage.py migrate --noinput
+```
 
 ---
 
-## 11. Optional Improvements
+## 5. SMTP Configuration
 
-For an enhanced and scalable production configuration, consider the following upgrades:
-- **Redis Integration**: Drop the relational database for temporary OTP limits and embrace Redis cache logic. Storing OTP states directly into an in-memory datastore radically bolsters API performance.
-- **Implement HTTPS via ALB**: Attach an AWS Application Load Balancer (ALB) to your EC2 instance, generate a free SSL certificate utilizing **AWS Certificate Manager (ACM)**, and force all HTTP port 80 traffic to explicitly redirect to secure port 443 ensuring all backend traffic is encrypted.
+- `EMAIL_HOST=smtp.gmail.com`, `EMAIL_PORT=587`, `EMAIL_USE_TLS=True`
+- Use a Gmail **App Password** (not your login password) for `EMAIL_HOST_PASSWORD`
+- EC2 outbound SG must allow port 587 (default allows all outbound)
 
 ---
 
-## 12. Common Errors & Fixes
+## 6. Common Errors & Fixes
 
-- **SMTP not sending emails**:
-  Make sure your `EMAIL_HOST_PASSWORD` isn't your login password but an explicitly generated App Password. Also, ensure your EC2 host isn't actively blocking outbound traffic on port 587 inherently via strict Outbound Security Group rules.
-- **DB connection issues (`OperationalError`)**:
-  Check your RDS precise inbound Security Groups. The target EC2 IP/Security Group must be explicitly whitelisted for port 5432. Double-check your `DB_HOST` guarantees it omits trailing spaces or database slashes.
-- **Static files not loading (404s)**:
-  Make universally sure you ran `python manage.py collectstatic`. Confirm your NGINX location `/static/` strictly maps to the absolute directory path on Linux, and that the `ubuntu` system user or `www-data` has `rx` (read and execute) permissions to access the path.
+| Error | Fix |
+|-------|-----|
+| **Runner offline** | Check NAT Gateway is working. Runner needs outbound to `github.com` |
+| **Docker build fails** | Check NAT Gateway. Docker needs to pull base images from Docker Hub |
+| **SMTP not sending** | Use App Password. Check outbound port 587 |
+| **DB connection refused** | RDS SG must allow 5432 from EC2 SG |
+| **502 from ALB** | EC2 SG must allow 8000 from ALB SG. Check `docker ps` |
+| **Target unhealthy** | `curl localhost:8000/api/health/` on EC2. Check container is running |
+
+---
+
+## 7. Useful Commands
+
+```bash
+# Docker
+docker ps                              # Running containers
+docker logs finovo-backend -f          # Live logs
+docker restart finovo-backend          # Restart
+docker exec -it finovo-backend bash    # Shell into container
+
+# GitHub Runner
+sudo systemctl status actions.runner.* # Runner status
+sudo systemctl restart actions.runner.* # Restart runner
+
+# Database (inside container)
+docker exec finovo-backend python manage.py migrate
+docker exec finovo-backend python manage.py createsuperuser
+docker exec finovo-backend python manage.py check --deploy
+```
