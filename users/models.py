@@ -35,7 +35,7 @@ class CustomUser(AbstractUser):
     """
     username = models.CharField(max_length=150, unique=True, null=True, blank=True)
     email = models.EmailField(_("email address"), unique=True)
-    is_verified = models.BooleanField(default=False)
+    is_verified = models.BooleanField(default=False, help_text='Whether the user has verified their email.')
     
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = ['username']
@@ -66,14 +66,12 @@ class UserProfile(models.Model):
     avatar = models.FileField(upload_to='avatars/', null=True, blank=True)
     phone_number = models.CharField(max_length=20, blank=True, default='',
         help_text='User phone number, e.g. +1 (555) 000-1234')
+    username = models.CharField(max_length=50, blank=True, default='',
+        help_text='Display username chosen at registration.')
     
-    # Notification Settings (Defaults to True)
-    budget_alerts_enabled = models.BooleanField(default=True)
-    weekly_reports_enabled = models.BooleanField(default=True)
-    daily_reminders_enabled = models.BooleanField(default=True)
-    email_updates_enabled = models.BooleanField(default=True)
-    push_notifications_enabled = models.BooleanField(default=True)
-    new_features_enabled = models.BooleanField(default=True)
+    # OTP fields for email verification and forgot password
+    otp_code = models.CharField(max_length=6, blank=True, null=True)
+    otp_expiry = models.DateTimeField(blank=True, null=True)
 
     @property
     def avatar_url(self):

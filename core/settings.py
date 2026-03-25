@@ -55,6 +55,7 @@ AUTH_USER_MODEL = "users.CustomUser"
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",          # Must be as high as possible
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",     # Serve static files in prod
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -90,10 +91,9 @@ DATABASES = {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": os.environ.get("DB_NAME", "budzz_db"),
         "USER": os.environ.get("DB_USER", "postgres"),
-        "PASSWORD": os.environ.get("DB_PASSWORD", "postgres"),
+        "PASSWORD": os.environ.get("DB_PASSWORD", "2002"),
         "HOST": os.environ.get("DB_HOST", "localhost"),
         "PORT": os.environ.get("DB_PORT", "5432"),
-        "ALLOWED_HOSTS": ['*'],
     }
 }
 
@@ -116,9 +116,8 @@ USE_I18N = True
 USE_TZ = True
 
 # ---------------------------------------------------------------------------
-# Static files
+# Static files (first declaration removed — see bottom of file)
 # ---------------------------------------------------------------------------
-STATIC_URL = "static/"
 
 # ---------------------------------------------------------------------------
 # Default primary key field type
@@ -126,9 +125,16 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ---------------------------------------------------------------------------
-# CORS — allow all origins in development
+# CORS — configurable per environment
 # ---------------------------------------------------------------------------
-CORS_ALLOW_ALL_ORIGINS = True
+_cors_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+if _cors_origins:
+    # If specific origins are set, use them (e.g. for a web frontend)
+    CORS_ALLOW_ALL_ORIGINS = False
+    CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins.split(",") if o.strip()]
+else:
+    # No origins set — allow all (safe for mobile-only apps like React Native)
+    CORS_ALLOW_ALL_ORIGINS = True
 
 # ---------------------------------------------------------------------------
 # Django REST Framework
@@ -178,9 +184,15 @@ else:
     MEDIA_URL = "/media/"
     MEDIA_ROOT = BASE_DIR / "profile_photos"
 
-# Standard Static handling
-STATIC_URL = "/static/"
+# Static files (single definition)
+STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "static_files"
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+
+# ---------------------------------------------------------------------------
+# Security — trust ALB's X-Forwarded-Proto header for HTTPS
+# ---------------------------------------------------------------------------
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # ---------------------------------------------------------------------------
 # Email / SMTP Configuration

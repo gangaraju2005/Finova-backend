@@ -36,15 +36,12 @@ class LoginSerializer(serializers.Serializer):
 class RegisterSerializer(serializers.Serializer):
     """Validates the payload for the registration endpoint."""
 
-    full_name      = serializers.CharField(max_length=150)
-    username       = serializers.CharField(max_length=150)
-    email          = serializers.EmailField()
-    mobile_number  = serializers.CharField(max_length=20, required=False, allow_blank=True)
-    password       = serializers.CharField(
-        write_only=True,
-        style={'input_type': 'password'},
-    )
-    confirm_password = serializers.CharField(
+    full_name = serializers.CharField(max_length=150)
+    username  = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    email     = serializers.EmailField()
+    mobile_number = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    password  = serializers.CharField(
+        min_length=6,
         write_only=True,
         style={'input_type': 'password'},
     )
@@ -60,16 +57,11 @@ class RegisterSerializer(serializers.Serializer):
         return value.lower()
 
     def validate_username(self, value):
-        if User.objects.filter(username__iexact=value).exists():
-            raise serializers.ValidationError(
-                'Username already taken.'
-            )
-        return value
-        
-    def validate(self, data):
-        if data.get('password') != data.get('confirm_password'):
-            raise serializers.ValidationError({"confirm_password": "Passwords do not match."})
-        return data
+        from users.models import UserProfile
+        if value and UserProfile.objects.filter(username__iexact=value.strip()).exists():
+            raise serializers.ValidationError('This username is already taken.')
+        return value.strip()
+
 
 class ProfileSerializer(serializers.Serializer):
     """Serializes the combined User + UserProfile data for the profile endpoint."""
@@ -79,6 +71,8 @@ class ProfileSerializer(serializers.Serializer):
     first_name           = serializers.SerializerMethodField()
     last_name            = serializers.SerializerMethodField()
     full_name            = serializers.SerializerMethodField()
+    username             = serializers.SerializerMethodField()
+    is_verified          = serializers.SerializerMethodField()
     monthly_savings_goal = serializers.SerializerMethodField()
     avatar_url           = serializers.SerializerMethodField()
     phone_number         = serializers.SerializerMethodField()
@@ -99,6 +93,12 @@ class ProfileSerializer(serializers.Serializer):
     def get_full_name(self, obj):
         user = obj['user']
         return f"{user.first_name} {user.last_name}".strip()
+
+    def get_username(self, obj):
+        return obj['profile'].username or ''
+
+    def get_is_verified(self, obj):
+        return getattr(obj['user'], 'is_verified', False)
 
     def get_monthly_savings_goal(self, obj):
         return float(obj['profile'].monthly_savings_goal)

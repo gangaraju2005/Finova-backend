@@ -8,10 +8,11 @@ All views for the transactions app:
   - TransactionListCreateView  GET/POST /api/transactions/
 """
 from collections import defaultdict
-from datetime import date
-from decimal import Decimal
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
-from django.db.models import Sum
+from django.db.models import Sum, Q
+from django.db import models
 from rest_framework import permissions, generics
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -20,8 +21,9 @@ from django.http import HttpResponse
 from .models import Category, Transaction, Budget, Notification
 from .serializers import DashboardSerializer, CategorySerializer, TransactionSerializer
 from .export_utils import (
-    generate_csv_export, generate_xlsx_export, 
-    parse_csv_import, parse_xlsx_import
+    generate_csv_export, generate_xlsx_export,
+    parse_csv_import, parse_xlsx_import,
+    generate_sample_csv,
 )
 from rest_framework.parsers import MultiPartParser, FormParser
 from core.dynamo_service import DynamoDBService
@@ -81,7 +83,7 @@ class DashboardView(APIView):
         recent_transactions = transactions.order_by('-date')[:4]
 
         data = {
-            'first_name':          user.first_name or user.email.split('@')[0],
+            'first_name':          (user.profile.username if hasattr(user, 'profile') and user.profile.username else user.first_name) or user.email.split('@')[0],
             'avatar_url':          user.profile.avatar_url if hasattr(user, 'profile') else None,
             'total_balance':       total_balance,
             'income_total':        income_total,
@@ -710,33 +712,50 @@ class NotificationBulkDeleteView(APIView):
         deleted_count, _ = Notification.objects.filter(user=request.user, pk__in=ids).delete()
         return Response({'deleted': deleted_count})
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Data Export & Cleanup
+# Data Export, Import & Cleanup
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ExportTransactionsView(APIView):
     """
     GET /api/transactions/export/?format=csv|xlsx
+    GET /api/transactions/export/?format=sample  — download a sample CSV template
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
         export_format = request.query_params.get('format', 'csv').lower()
-        transactions = Transaction.objects.filter(user=request.user).order_by('-date')
+
+        # ── Sample template ──────────────────────────────────────────────────
+        if export_format == 'sample':
+            content = generate_sample_csv()
+            response = HttpResponse(content, content_type='text/csv')
+            response['Content-Disposition'] = 'attachment; filename="finovo_sample_template.csv"'
+            return response
+
+        transactions = Transaction.objects.filter(user=request.user).select_related('category').order_by('-date')
+
+        if not transactions.exists():
+            return Response({'error': 'No transactions to export'}, status=404)
 
         if export_format == 'csv':
             content = generate_csv_export(transactions)
-            response = HttpResponse(content, content_type='text/csv')
-            response['Content-Disposition'] = 'attachment; filename="transactions.csv"'
+            response = HttpResponse(content, content_type='text/csv; charset=utf-8')
+            response['Content-Disposition'] = f'attachment; filename="finovo_transactions_{date.today()}.csv"'
             return response
-        
+
         elif export_format == 'xlsx':
             content = generate_xlsx_export(transactions)
-            response = HttpResponse(content, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            response['Content-Disposition'] = 'attachment; filename="transactions.xlsx"'
+            response = HttpResponse(
+                content,
+                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+            response['Content-Disposition'] = f'attachment; filename="finovo_transactions_{date.today()}.xlsx"'
             return response
-        
-        return Response({'error': 'Unsupported format'}, status=400)
+
+        return Response({'error': 'Unsupported format. Use ?format=csv or ?format=xlsx'}, status=400)
+
 
 class CleanupDataView(APIView):
     """
@@ -746,26 +765,38 @@ class CleanupDataView(APIView):
 
     def delete(self, request):
         deleted_tx, _ = Transaction.objects.filter(user=request.user).delete()
-        # Also clean up budgets if they are tied to transactions or just the user
-        # deleted_budgets, _ = Budget.objects.filter(user=request.user).delete()
-        
         return Response({
             'message': 'Data cleared successfully',
             'deleted_transactions': deleted_tx
         })
 
+
 class ImportTransactionsView(APIView):
     """
     POST /api/transactions/import/
-    Body: multipart/form-data with 'file' field
+    Body: multipart/form-data with 'file' field (.csv or .xlsx)
+
+    Returns:
+        {
+          "success_count": N,
+          "failed_count": M,
+          "failed_rows": [ { "row": 3, "reason": "..." }, ... ]
+        }
     """
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
+
+    # File size limit: 5 MB
+    MAX_FILE_SIZE = 5 * 1024 * 1024
 
     def post(self, request):
         file_obj = request.FILES.get('file')
         if not file_obj:
             return Response({'error': 'No file provided'}, status=400)
+
+        # ── File size check ─────────────────────────────────────────────────
+        if file_obj.size > self.MAX_FILE_SIZE:
+            return Response({'error': 'File too large. Maximum allowed size is 5 MB.'}, status=400)
 
         filename = file_obj.name.lower()
         try:
@@ -774,63 +805,90 @@ class ImportTransactionsView(APIView):
             elif filename.endswith('.xlsx'):
                 data_list = parse_xlsx_import(file_obj)
             else:
-                return Response({'error': 'Unsupported file format. Use .csv or .xlsx'}, status=400)
-            
-            imported_count = 0
-            for item in data_list:
-                # Basic validation
-                if not item.get('description') or not item.get('amount'):
-                    continue
-                
-                # Category matching
-                cat_name = item.get('category_name') or 'Uncategorized'
-                cat_type = (item.get('category_type') or 'Expense').upper()
-                if cat_type not in [Category.CategoryType.INCOME, Category.CategoryType.EXPENSE]:
-                    cat_type = Category.CategoryType.EXPENSE
-                
-                # Try to find existing category for user, or global
-                category = Category.objects.filter(
-                    models.Q(user=request.user) | models.Q(user__isnull=True),
-                    name__iexact=cat_name
-                ).first()
-                
-                if not category:
-                    category = Category.objects.create(
-                        user=request.user,
-                        name=cat_name,
-                        type=cat_type,
-                        icon_name='help-circle',
-                        color='#94A3B8'
-                    )
-
-                # Date parsing
-                date_str = item.get('date')
-                tx_date = None
-                if date_str:
-                    from django.utils.dateparse import parse_datetime
-                    from datetime import datetime
-                    try:
-                        # Try YYYY-MM-DD
-                        tx_date = datetime.strptime(date_str.split(' ')[0], '%Y-%m-%d')
-                    except:
-                        tx_date = parse_datetime(date_str)
-                
-                if not tx_date:
-                    tx_date = datetime.now()
-
-                Transaction.objects.create(
-                    user=request.user,
-                    category=category,
-                    amount=item.get('amount'),
-                    description=item.get('description'),
-                    date=tx_date
+                return Response(
+                    {'error': 'Unsupported file format. Please upload a .csv or .xlsx file.'},
+                    status=400
                 )
-                imported_count += 1
-
-            return Response({
-                'message': f'Successfully imported {imported_count} transactions',
-                'count': imported_count
-            })
-
         except Exception as e:
-            return Response({'error': f'Import failed: {str(e)}'}, status=500)
+            return Response({'error': f'Could not read file: {str(e)}'}, status=400)
+
+        if not data_list:
+            return Response({'error': 'The file is empty or has no data rows.'}, status=400)
+
+        # ── Category cache: avoid repeated DB hits ─────────────────────────
+        # Pre-load all categories available to this user
+        existing_categories = {
+            (cat.name.lower(), cat.type): cat
+            for cat in Category.objects.filter(
+                Q(user=request.user) | Q(user__isnull=True)
+            )
+        }
+        new_categories = {}
+
+        to_create = []
+        failed_rows = []
+
+        for row in data_list:
+            row_num = row.get('row_num', '?')
+
+            # ── Collect validation errors from normalisation ──
+            errors = row.get('errors', [])
+
+            if row.get('amount') is None:
+                # amount parsing already added an error; skip
+                failed_rows.append({'row': row_num, 'reason': '; '.join(errors)})
+                continue
+
+            if errors:
+                # Non-fatal validation issues (e.g. bad date defaulted) — still import
+                # but only skip if description is missing
+                if not row.get('description'):
+                    failed_rows.append({'row': row_num, 'reason': '; '.join(errors)})
+                    continue
+
+            # ── Category resolution ──────────────────────────────────────────
+            cat_name = row['category_name']
+            cat_type = row['category_type']   # 'INCOME' or 'EXPENSE'
+            cache_key = (cat_name.lower(), cat_type)
+
+            if cache_key in existing_categories:
+                category = existing_categories[cache_key]
+            elif cache_key in new_categories:
+                category = new_categories[cache_key]
+            else:
+                # Create a user-specific category on the fly
+                category = Category(
+                    user=request.user,
+                    name=cat_name,
+                    type=cat_type,
+                    icon_name='help-circle-outline',
+                    color='#94A3B8'
+                )
+                category.save()   # save individually so FK works in Transaction
+                new_categories[cache_key] = category
+                existing_categories[cache_key] = category
+
+            # ── Build Transaction object ─────────────────────────────────────
+            to_create.append(Transaction(
+                user=request.user,
+                category=category,
+                amount=Decimal(str(row['amount'])),
+                description=row['description'],
+                payment_method=row['payment_method'],
+                date=row['date'],
+            ))
+
+        # ── Bulk insert in chunks of 500 ────────────────────────────────────
+        CHUNK_SIZE = 500
+        success_count = 0
+        for i in range(0, len(to_create), CHUNK_SIZE):
+            chunk = to_create[i:i + CHUNK_SIZE]
+            Transaction.objects.bulk_create(chunk)
+            success_count += len(chunk)
+
+        return Response({
+            'message': f'Import complete. {success_count} transactions imported.',
+            'success_count': success_count,
+            'failed_count': len(failed_rows),
+            'failed_rows': failed_rows,
+        })
