@@ -76,10 +76,10 @@ def generate_xlsx_export(transactions):
     header_font = Font(bold=True)
     for cell in ws[1]:
 
-    # ── Header row styling ──────────────────────────────────────────────────
-    header_fill = PatternFill(start_color='1A1F36', end_color='1A1F36', fill_type='solid')
-    header_font = Font(bold=True, color='FFFFFF', size=11)
-    header_align = Alignment(horizontal='center', vertical='center')
+        # ── Header row styling ──────────────────────────────────────────────────
+        header_fill = PatternFill(start_color='1A1F36', end_color='1A1F36', fill_type='solid')
+        header_font = Font(bold=True, color='FFFFFF', size=11)
+        header_align = Alignment(horizontal='center', vertical='center')
 
     ws.append(EXPORT_HEADERS)
     for col_idx, cell in enumerate(ws[1], start=1):

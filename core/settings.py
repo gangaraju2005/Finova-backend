@@ -22,12 +22,14 @@ SECRET_KEY = os.environ.get(
     "django-insecure-fallback-key-change-in-production",
 )
 
-DEBUG = os.environ.get("DEBUG", "True") == "True"
+# DEBUG = os.environ.get("DEBUG", "True") == "True"
+DEBUG = True
 
 # If DEBUG is True, ALLOWED_HOSTS can default to ["*"]
 # In production, specify your domains (e.g., finovo.app, api.finovo.app) in .env
 hosts = os.environ.get("ALLOWED_HOSTS", "*" if DEBUG else "")
-ALLOWED_HOSTS = [h.strip() for h in hosts.split(",")] if hosts else []
+# ALLOWED_HOSTS = [h.strip() for h in hosts.split(",")] if hosts else []
+ALLOWED_HOSTS = ["*"]
 
 # ---------------------------------------------------------------------------
 # Application definition
